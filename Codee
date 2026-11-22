@@ -1,0 +1,220 @@
+/** OPD Smart Triage — Google Apps Script backend.
+ * Configure the spreadsheet ID in Script Properties as SPREADSHEET_ID,
+ * then run setupSheets() as an authorized administrator.
+ */
+const SCHEMAS = {
+  Patient_Data: ['Assessment_ID','Encounter_DateTime','Age_Years','Sex','Patient_Type','Chief_Complaint','Symptom_Onset','Associated_Symptoms','Underlying_Disease','Drug_Allergy','Danger_Signs','Created_At','Created_By','Updated_At','Updated_By'],
+  Vital_Signs: ['Assessment_ID','Measured_At','BP_Systolic','BP_Diastolic','Pulse_Rate','Respiratory_Rate','Temperature_C','SpO2_Percent','Pain_Score','GCS_Eye','GCS_Verbal','GCS_Motor','GCS_Total','GCS_Indicated','Recorded_At','Recorded_By'],
+  Triage_Result: ['Assessment_ID','Triage_Level','Triage_Reason','Initial_Action','Assessor_Name','Assessor_User_ID','Assessment_Started_At','Assessment_Completed_At','Team_Notification_Status','Team_Notified_At','Created_At','Updated_At'],
+  Users: ['User_ID','Display_Name','Role','Active','Organization_Email','Password_Hash','Created_At','Updated_At','Updated_By'],
+  Dashboard_Data: ['Period_Date','Period_Type','Triage_Level','Patient_Count','Chief_Complaint_Group','Refreshed_At'],
+  Audit_Log: ['Audit_ID','Assessment_ID','Action','Entity','Changed_Fields','Old_Value','New_Value','Actor_User_ID','Actor_Role','Event_At','Reason','Request_ID']
+};
+const APP_ROLES = ['พยาบาลคัดกรอง','พยาบาลผู้รับผิดชอบ','ผู้ดูแลระบบ'];
+const PASSWORD_SALT = 'OPD-Smart-Triage-Seed-2026-v1';
+// บัญชีเริ่มต้น 10 บัญชี เก็บเฉพาะ SHA-256 hash ใน source code
+const SEED_USERS = [
+  {id:'admin',name:'ผู้ดูแลระบบ',role:'ผู้ดูแลระบบ',hash:'xtYE4hG0VmXB7nOvF4rojwv2Z13EaQqOTvLl723ywmg='},
+  {id:'user01',name:'พยาบาลคัดกรอง 01',role:'พยาบาลคัดกรอง',hash:'hlfLDRRGZ87ctdugxhClBgm6dnTH7exP3FVrBv3z5H0='},
+  {id:'user02',name:'พยาบาลคัดกรอง 02',role:'พยาบาลคัดกรอง',hash:'zJxyIGcAKTXx3jopDoLojnepTqstM8G6KXsWzeUtg1o='},
+  {id:'user03',name:'พยาบาลคัดกรอง 03',role:'พยาบาลคัดกรอง',hash:'G35saAv36xNZm5Q6gc7DMRK8Pye4lVwy3KZsEDrJwLA='},
+  {id:'user04',name:'พยาบาลคัดกรอง 04',role:'พยาบาลคัดกรอง',hash:'VICd/EyMkSvtygBQrEGvxmp03OHOeip8tc81cKch8S8='},
+  {id:'user05',name:'พยาบาลคัดกรอง 05',role:'พยาบาลคัดกรอง',hash:'jI3rakiVb5JjBdaPGPKpQ/CfKGweEus5AjuONgEu06Y='},
+  {id:'user06',name:'พยาบาลคัดกรอง 06',role:'พยาบาลคัดกรอง',hash:'sC9TXxyjHu0fCUQmuijTyh5iQemHAOCCZz9cY+/8W7g='},
+  {id:'user07',name:'พยาบาลคัดกรอง 07',role:'พยาบาลคัดกรอง',hash:'AKB2V71G+5/sWg87FBhqmR84w5CidNd/voHEP8R5BkI='},
+  {id:'user08',name:'พยาบาลคัดกรอง 08',role:'พยาบาลคัดกรอง',hash:'MUs03MeIzHWakjh5zjBVt3893ArCzWBW07J4jdOARJw='},
+  {id:'user09',name:'พยาบาลผู้รับผิดชอบ 09',role:'พยาบาลผู้รับผิดชอบ',hash:'nfht4BKIS5LF8u8wlA9TJ2bMiiioxn61OwGNnN0IovU='}
+];
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index').setTitle('OPD Smart Triage').addMetaTag('viewport','width=device-width, initial-scale=1');
+}
+
+/** Idempotently creates missing sheets and headers. Existing data is never cleared. */
+function setupSheets() {
+  const ss = getSpreadsheet_();
+  const created = [], existing = [], mismatches = [];
+  Object.keys(SCHEMAS).forEach(name => {
+    let sh = ss.getSheetByName(name);
+    if (!sh) { sh = ss.insertSheet(name); created.push(name); }
+    else existing.push(name);
+    if (sh.getLastRow() === 0) sh.getRange(1,1,1,SCHEMAS[name].length).setValues([SCHEMAS[name]]).setFontWeight('bold');
+    else {
+      let current = sh.getRange(1,1,1,Math.max(sh.getLastColumn(),1)).getDisplayValues()[0];
+      // Safe schema upgrade: append missing known headers without moving or
+      // overwriting existing columns/data. Column order is resolved by header name.
+      const unknown=current.filter(h=>h && SCHEMAS[name].indexOf(h)<0);
+      const additions=SCHEMAS[name].filter(h=>current.indexOf(h)<0);
+      if(additions.length && unknown.length===0) {
+        sh.getRange(1,sh.getLastColumn()+1,1,additions.length).setValues([additions]).setFontWeight('bold');
+        current=current.concat(additions);
+      }
+      const mismatch = SCHEMAS[name].some((h,i)=>current[i]!==h) || current.length>SCHEMAS[name].length;
+      if (mismatch) mismatches.push({sheet:name, expected:SCHEMAS[name], found:current});
+    }
+    sh.setFrozenRows(1);
+  });
+  const seeded=seedUsers_();
+  return {ok:true, spreadsheet:ss.getName(), created, existing, mismatches, seededUsers:seeded, note:'ไม่ลบหรือเขียนทับข้อมูลเดิม'};
+}
+
+function seedUsers_() {
+  const sh=getSpreadsheet_().getSheetByName('Users');
+  const headers=sh.getRange(1,1,1,sh.getLastColumn()).getDisplayValues()[0];
+  const idCol=headers.indexOf('User_ID')+1, hashCol=headers.indexOf('Password_Hash')+1, activeCol=headers.indexOf('Active')+1;
+  if(!idCol || !hashCol) throw new Error('ชีต Users ต้องมีหัวคอลัมน์ User_ID และ Password_Hash ให้รัน setupSheets() ใหม่');
+  const rows=sh.getLastRow()>1?sh.getRange(2,1,sh.getLastRow()-1,sh.getLastColumn()).getValues():[];
+  const byId={}; rows.forEach((r,i)=>byId[String(r[idCol-1])]=i+2);
+  const now=new Date(), added=[], backfilled=[];
+  SEED_USERS.forEach(u=>{
+    const row=byId[u.id];
+    if(!row) {
+      appendObject_('Users',{User_ID:u.id,Display_Name:u.name,Role:u.role,Active:true,Organization_Email:'',Password_Hash:u.hash,Created_At:now,Updated_At:now,Updated_By:'setupSheets'});
+      added.push(u.id);
+    } else {
+      let changed=false;
+      if(!sh.getRange(row,hashCol).getValue()){sh.getRange(row,hashCol).setValue(u.hash);changed=true;}
+      if(activeCol && sh.getRange(row,activeCol).getValue()===''){sh.getRange(row,activeCol).setValue(true);changed=true;}
+      if(changed) backfilled.push(u.id);
+    }
+  });
+  return {added, backfilled, total:SEED_USERS.length};
+}
+
+function login(username,password) {
+  username=String(username||'').trim(); password=String(password||'');
+  const user=readRows_('Users').find(x=>String(x.User_ID)===username && truthy_(x.Active));
+  if(!user || !user.Password_Hash || hashPassword_(username,password)!==String(user.Password_Hash)) throw new Error('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง');
+  const sessionUser={id:String(user.User_ID),name:String(user.Display_Name||user.User_ID),role:String(user.Role||'')};
+  const token=Utilities.getUuid()+Utilities.getUuid().replace(/-/g,'');
+  CacheService.getScriptCache().put('opd-session-'+token,JSON.stringify(sessionUser),21600);
+  return {ok:true,token,user:sessionUser,expiresIn:21600};
+}
+function logout(token) { if(token) CacheService.getScriptCache().remove('opd-session-'+String(token)); return {ok:true}; }
+
+function getAppContext(token) {
+  const user = requireUser_(token);
+  return {user, levels:getTriageLevels_(), now:new Date().toISOString()};
+}
+
+function getDashboardData(filters,token) {
+  requireUser_(token);
+  const from = filters && filters.from ? new Date(filters.from+'T00:00:00') : new Date(new Date().setDate(new Date().getDate()-6));
+  const to = filters && filters.to ? new Date(filters.to+'T23:59:59') : new Date();
+  const patientRows = readRows_('Patient_Data');
+  const triageRows = readRows_('Triage_Result');
+  const vitals = readRows_('Vital_Signs');
+  const tMap = {}; triageRows.forEach(r => tMap[r.Assessment_ID] = r);
+  const entries = patientRows.filter(p => { const d = asDate_(p.Encounter_DateTime); return d && d >= from && d <= to; }).map(p => ({...p, ...(tMap[p.Assessment_ID]||{})}));
+  const levels = getTriageLevels_();
+  const byLevel = {}; levels.forEach(x => byLevel[x] = 0);
+  const byDay = {}, byComplaint = {};
+  entries.forEach(e => {
+    if (e.Triage_Level) byLevel[e.Triage_Level] = (byLevel[e.Triage_Level]||0)+1;
+    const day = dateKey_(asDate_(e.Encounter_DateTime)); byDay[day] = (byDay[day]||0)+1;
+    const c = String(e.Chief_Complaint||'ไม่ระบุ').trim().slice(0,50); byComplaint[c] = (byComplaint[c]||0)+1;
+  });
+  const vMap = {}; vitals.forEach(v => vMap[v.Assessment_ID] = v);
+  const recent = entries.slice().sort((a,b)=>asDate_(b.Encounter_DateTime)-asDate_(a.Encounter_DateTime)).slice(0,12).map(e=>({Assessment_ID:e.Assessment_ID, Encounter_DateTime:e.Encounter_DateTime, Chief_Complaint:e.Chief_Complaint, Triage_Level:e.Triage_Level||'รอยืนยัน', Team_Notification_Status:e.Team_Notification_Status||'—'}));
+  return {total:entries.length, byLevel, byDay, byComplaint:Object.entries(byComplaint).sort((a,b)=>b[1]-a[1]).slice(0,8), recent, levels};
+}
+
+function saveAssessment(form,token) {
+  const user = requireRole_(token,[APP_ROLES[0],APP_ROLES[1],APP_ROLES[2]]);
+  validateAssessment_(form);
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const ss = getSpreadsheet_(), id = form.Assessment_ID || newAssessmentId_(), now = new Date();
+    if (findRow_('Patient_Data','Assessment_ID',id)) throw new Error('รหัสประเมินนี้ถูกบันทึกแล้ว กรุณาเริ่มรายการใหม่');
+    const created = now;
+    appendObject_('Patient_Data', {
+      Assessment_ID:id, Encounter_DateTime:form.Encounter_DateTime || now, Age_Years:form.Age_Years, Sex:form.Sex, Patient_Type:form.Patient_Type,
+      Chief_Complaint:form.Chief_Complaint, Symptom_Onset:form.Symptom_Onset, Associated_Symptoms:form.Associated_Symptoms,
+      Underlying_Disease:form.Underlying_Disease, Drug_Allergy:form.Drug_Allergy, Danger_Signs:form.Danger_Signs,
+      Created_At:created, Created_By:user.email, Updated_At:created, Updated_By:user.email
+    });
+    appendObject_('Vital_Signs', {
+      Assessment_ID:id, Measured_At:form.Measured_At||now, BP_Systolic:form.BP_Systolic, BP_Diastolic:form.BP_Diastolic,
+      Pulse_Rate:form.Pulse_Rate, Respiratory_Rate:form.Respiratory_Rate, Temperature_C:form.Temperature_C, SpO2_Percent:form.SpO2_Percent,
+      Pain_Score:form.Pain_Score, GCS_Eye:form.GCS_Eye, GCS_Verbal:form.GCS_Verbal, GCS_Motor:form.GCS_Motor,
+      GCS_Total:form.GCS_Total, GCS_Indicated:form.GCS_Indicated, Recorded_At:now, Recorded_By:user.email
+    });
+    appendObject_('Triage_Result', {
+      Assessment_ID:id, Triage_Level:form.Triage_Level, Triage_Reason:form.Triage_Reason, Initial_Action:form.Initial_Action,
+      Assessor_Name:form.Assessor_Name||user.name, Assessor_User_ID:user.id, Assessment_Started_At:form.Assessment_Started_At||now,
+      Assessment_Completed_At:now, Team_Notification_Status:form.Team_Notification_Status||'ยังไม่แจ้ง',
+      Team_Notified_At:form.Team_Notified_At||'', Created_At:now, Updated_At:now
+    });
+    audit_(id,'CREATE','Assessment','',JSON.stringify({Triage_Level:form.Triage_Level}),user,'บันทึกผลประเมิน');
+    return {ok:true, Assessment_ID:id, savedAt:now.toISOString()};
+  } finally { lock.releaseLock(); }
+}
+
+function getAssessment(assessmentId,token) {
+  requireUser_(token);
+  const p=findRow_('Patient_Data','Assessment_ID',assessmentId), v=findRow_('Vital_Signs','Assessment_ID',assessmentId), t=findRow_('Triage_Result','Assessment_ID',assessmentId);
+  if (!p) throw new Error('ไม่พบรายการประเมิน');
+  return {patient:p, vitals:v||{}, result:t||{}};
+}
+
+function searchAssessments(filters,token) {
+  requireUser_(token); filters=filters||{};
+  const p=readRows_('Patient_Data'), t=readRows_('Triage_Result'), map={}; t.forEach(x=>map[x.Assessment_ID]=x);
+  const q=String(filters.query||'').toLowerCase(), level=String(filters.level||'');
+  return p.map(x=>({...x,...(map[x.Assessment_ID]||{})})).filter(x=>{
+    if(q && !String(x.Assessment_ID).toLowerCase().includes(q)) return false;
+    if(level && x.Triage_Level!==level) return false;
+    const d=asDate_(x.Encounter_DateTime);
+    if(filters.from && d && d<new Date(filters.from+'T00:00:00')) return false;
+    if(filters.to && d && d>new Date(filters.to+'T23:59:59')) return false;
+    return true;
+  }).sort((a,b)=>asDate_(b.Encounter_DateTime)-asDate_(a.Encounter_DateTime)).slice(0,200);
+}
+
+function getReportData(filters,token) { return getDashboardData(filters||{},token); }
+
+function requireUser_(token) {
+  const raw=token?CacheService.getScriptCache().get('opd-session-'+String(token)):null;
+  if(!raw) throw new Error('เซสชันหมดอายุหรือไม่ได้เข้าสู่ระบบ กรุณาเข้าสู่ระบบใหม่');
+  const session=JSON.parse(raw);
+  const user=readRows_('Users').find(x=>String(x.User_ID)===session.id && truthy_(x.Active));
+  if(!user) throw new Error('บัญชีนี้ถูกปิดใช้งาน');
+  return {id:String(user.User_ID),name:String(user.Display_Name||user.User_ID),role:String(user.Role||'')};
+}
+function requireRole_(token,roles) { const u=requireUser_(token); if(roles.indexOf(u.role)<0) throw new Error('บัญชีนี้ไม่มีสิทธิ์ดำเนินการ'); return u; }
+function hashPassword_(username,password) {
+  const bytes=Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,username+'|'+password+'|'+PASSWORD_SALT,Utilities.Charset.UTF_8);
+  return Utilities.base64Encode(bytes);
+}
+function getSpreadsheet_() {
+  const id=PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if(id) return SpreadsheetApp.openById(id);
+  const active=SpreadsheetApp.getActiveSpreadsheet(); if(active) return active;
+  throw new Error('กำหนด Script Property SPREADSHEET_ID ก่อนใช้งาน');
+}
+function getTriageLevels_() { return ['ระดับ 1','ระดับ 2','ระดับ 3','ระดับ 4','ระดับ 5']; }
+function newAssessmentId_() { return 'OPD-'+Utilities.formatDate(new Date(),Session.getScriptTimeZone(),'yyyyMMdd-HHmmss')+'-'+Math.floor(100+Math.random()*900); }
+function validateAssessment_(f) {
+  if(!f || typeof f!=='object') throw new Error('ข้อมูลแบบประเมินไม่ถูกต้อง');
+  ['Age_Years','Sex','Patient_Type','Chief_Complaint','Triage_Level','Triage_Reason','Assessor_Name'].forEach(k=>{if(String(f[k]||'').trim()==='') throw new Error('กรุณากรอกข้อมูลที่จำเป็นให้ครบ');});
+  const age=Number(f.Age_Years); if(!Number.isFinite(age)||age<0||age>130) throw new Error('อายุไม่ถูกต้อง');
+  if(getTriageLevels_().indexOf(f.Triage_Level)<0) throw new Error('ระดับคัดกรองไม่ถูกต้อง');
+  [['BP_Systolic',0,400],['BP_Diastolic',0,300],['Pulse_Rate',0,400],['Respiratory_Rate',0,100],['Temperature_C',25,50],['SpO2_Percent',0,100],['Pain_Score',0,10]].forEach(([k,min,max])=>{if(f[k]!==''&&f[k]!=null){const n=Number(f[k]);if(!Number.isFinite(n)||n<min||n>max)throw new Error('ค่าที่กรอกไม่ถูกต้อง: '+k);}});
+}
+function readRows_(sheetName) {
+  const sh=getSpreadsheet_().getSheetByName(sheetName); if(!sh||sh.getLastRow()<2) return [];
+  const values=sh.getDataRange().getValues(), headers=values.shift();
+  return values.filter(r=>r.some(c=>c!==''&&c!=null)).map(r=>{const o={}; headers.forEach((h,i)=>o[h]=r[i] instanceof Date?r[i].toISOString():r[i]); return o;});
+}
+function appendObject_(sheetName,obj) {
+  const sh=getSpreadsheet_().getSheetByName(sheetName); if(!sh) throw new Error('ไม่พบชีต '+sheetName+' กรุณาเรียก setupSheets()');
+  const headers=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  sh.appendRow(headers.map(h=>obj[h]===undefined?'':obj[h]));
+}
+function findRow_(sheetName,key,value) { return readRows_(sheetName).find(r=>String(r[key])===String(value))||null; }
+function audit_(id,action,entity,oldValue,newValue,user,reason) {
+  appendObject_('Audit_Log',{Audit_ID:Utilities.getUuid(),Assessment_ID:id,Action:action,Entity:entity,Changed_Fields:'',Old_Value:oldValue,New_Value:newValue,Actor_User_ID:user.id,Actor_Role:user.role,Event_At:new Date(),Reason:reason,Request_ID:''});
+}
+function asDate_(v) { if(v instanceof Date) return v; if(!v) return null; const d=new Date(v); return isNaN(d)?null:d; }
+function dateKey_(d) { return d?Utilities.formatDate(d,Session.getScriptTimeZone(),'yyyy-MM-dd'):'ไม่ระบุ'; }
+function truthy_(v) { return v===true || String(v).toLowerCase()==='true' || String(v)==='1' || String(v).toLowerCase()==='yes'; }
